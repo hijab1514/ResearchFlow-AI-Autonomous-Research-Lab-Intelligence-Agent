@@ -1,0 +1,35 @@
+# configs/scheduler_config.yaml
+# =============================================================================
+# Resource thresholds consumed by the Streamlit UI (app/backend.get_config()).
+# These drive the gauge threshold lines on the Lab Assistant dashboard.
+#
+# READ BEFORE EDITING — the config/behaviour split:
+#   The SchedulerAgent's *runtime* behaviour (tick interval, worker count,
+#   priority aging, and the CPU throttle threshold) is currently controlled by
+#   ENVIRONMENT VARIABLES in agents/scheduler_agent.py, NOT by this file.
+#
+#   Editing the values below changes what the dashboard DISPLAYS, but does not
+#   yet change how the scheduler ACTUALLY behaves. For example, the throttle is
+#   hardcoded to fire at CPU > 85% in _adjust_concurrency; lowering cpu_threshold
+#   here only moves the gauge's red line, not the real trigger point.
+#
+#   To unify them, have SchedulerAgent load these values instead of reading
+#   os.getenv(...). Until then, keep this file and the env vars in sync by hand.
+# =============================================================================
+
+scheduler:
+  # CPU % at/above which the dashboard marks the CPU gauge red.
+  # Keep aligned with the hardcoded 85.0 in _adjust_concurrency.
+  cpu_threshold: 85
+
+  # Available-RAM % below which memory-heavy tasks should defer.
+  # The dashboard converts this to a "used %" gauge line as (100 - value) = 80.
+  ram_threshold: 20
+
+  # GPU VRAM % at/above which LLM / GPU-heavy tasks should pause.
+  gpu_threshold: 90
+
+arxiv:
+  # Default number of papers retrieved per query. The UI slider overrides this
+  # per run; this is the fallback / documented default.
+  max_results: 100
