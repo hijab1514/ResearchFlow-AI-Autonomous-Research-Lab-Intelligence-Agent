@@ -4,25 +4,25 @@ ResearchFlow AI — Streamlit entry point (app/main.py)
 Run from the repo root:
     streamlit run app/main.py
 
-Jobs of this file:
-  1. Fix sys.path so top-level packages (agents/, nlp/, scheduler/, ...) import
-     correctly when Streamlit runs a script inside app/.
-  2. Boot shared state (config, session_state) used by app/pages/.
-  3. Provide a working home screen + research launcher.
+Wired to the REAL pipelines/research_pipeline.py:
+  - ResearchPipeline(lab_agent, scheduler, config)   # required args
+  - async run(query) -> PipelineResult               # query only; max_papers via config
+  - Streamlit (sync) drives the coroutine via asyncio.run
+  - live progress is drained from the pipeline's event queue
 
-Runs in DEMO MODE with no API key and no backend, so it launches today.
-To use your real pipeline, edit ONLY the run_research() adapter block.
+Runs in DEMO MODE with no API key / no backend so it always launches.
+Backend wiring lives in ONE place: the BACKEND ADAPTER block.
 """
 
 from __future__ import annotations
 
 import sys
 import time
+import asyncio
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
-# 1. PATH BOOTSTRAP (before importing your packages)
-# app/main.py -> app/ -> repo root
+# 1. PATH BOOTSTRAP — app/main.py -> app/ -> repo root
 # --------------------------------------------------------------------------- #
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -53,55 +53,133 @@ except Exception:
 
 
 # --------------------------------------------------------------------------- #
-# 2. BACKEND ADAPTER  ←←←  EDIT THIS BLOCK TO MATCH YOUR CODE
+# 2. BACKEND ADAPTER  ←←←  the only block tied to your real code
 # --------------------------------------------------------------------------- #
 BACKEND_AVAILABLE = False
 BACKEND_ERROR = ""
 try:
-    # >>> EDIT to match your real module + class <
-    from pipelines.research_pipeline import ResearchPipeline  # type: ignore
+    from pipelines.research_pipeline import ResearchPipeline, PipelineResult  # noqa: F401
+    from pipelines.pipeline_base import PipelineConfig
+    from agents.lab_agent import LabAgent
+    from agents.scheduler_agent import SchedulerAgent
     BACKEND_AVAILABLE = True
 except Exception as e:
     BACKEND_ERROR = f"{type(e).__name__}: {e}"
 
 
-def run_research(topic: str, max_papers: int, force_demo: bool = False) -> dict:
+def _get_lab_and_scheduler():
     """
-    Single integration point between UI and backend.
+    LabAgent + SchedulerAgent are background-thread services. Create them ONCE
+    and cache in session_state so we don't spawn new threads on every rerun.
+    (Thread-based services are safe to persist; the pipeline's asyncio.Queue is
+    NOT — see _build_pipeline.)
+    """
+    ss = st.session_state
+    if ss.get("_lab") is None:
+        lab = LabAgent()
+        lab.start()
+        ss["_lab"] = lab
+    if ss.get("_scheduler") is None:
+        sched = SchedulerAgent(lab_agent=ss["_lab"], max_workers=2)
+        sched.start()
+        ss["_scheduler"] = sched
+    return ss["_lab"], ss["_scheduler"]
 
-    Expected return shape:
-        {
-            "topic": str, "n_papers": int,
-            "clusters": [{"label": str, "size": int, "reproducibility": float}],
-            "gaps": [{"title": str, "confidence": float, "evidence": str}],
-            "elapsed_s": float, "demo": bool,
-        }
+
+def _build_pipeline(max_papers: int) -> "ResearchPipeline":
     """
+    Build a FRESH ResearchPipeline per run.
+
+    Why fresh: ResearchPipeline creates an asyncio.Queue in __init__. Reusing one
+    pipeline across multiple asyncio.run() calls (each a new event loop) causes
+    'Future attached to a different loop' errors. Lab/scheduler are reused; the
+    pipeline (cheap to build — agents are lazy) is rebuilt each run.
+    """
+    lab, sched = _get_lab_and_scheduler()
+    config = PipelineConfig(
+        llm_model="gpt-4o",
+        max_papers=max_papers,        # <-- slider feeds config, not run()
+        hypotheses_per_gap=1,
+        max_hypotheses=3,
+        roadmap_target_papers=10,
+        roadmap_weeks=4,
+        use_stage_cache=True,
+        verbose=False,
+    )
+    return ResearchPipeline(lab_agent=lab, scheduler=sched, config=config)
+
+
+def _run_pipeline_blocking(pipeline, query: str, on_event=None) -> "PipelineResult":
+    """
+    Drive the async pipeline from sync Streamlit.
+
+    Note: pipeline.stream() yields ProgressEvents but DISCARDS the PipelineResult
+    (it never returns task.result()). So we run pipeline.run() ourselves and drain
+    the event queue for live progress, which gives us BOTH progress and the result.
+    """
+    async def _drive():
+        task = asyncio.create_task(pipeline.run(query))
+        q = pipeline._event_queue  # private, but the only place the result-run emits
+        while not task.done():
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=0.3)
+                if on_event:
+                    on_event(ev)
+            except asyncio.TimeoutError:
+                pass
+        while not q.empty():
+            ev = q.get_nowait()
+            if on_event:
+                on_event(ev)
+        return task.result()
+
+    return asyncio.run(_drive())
+
+
+def _normalize(result: "PipelineResult") -> dict:
+    """Map PipelineResult onto the keys the UI renderer expects."""
+    clusters = [
+        {
+            "label": getattr(c, "label", f"Cluster {getattr(c, 'cluster_id', '?')}"),
+            "size": getattr(c, "paper_count", 0),
+            "reproducibility": getattr(c, "reproducibility_score", 0.0),
+        }
+        for c in (result.clusters or [])
+    ]
+    gaps = [
+        {
+            "title": getattr(g, "title", ""),
+            "confidence": getattr(g, "confidence", 0.0),
+            "evidence": getattr(g, "description", ""),
+        }
+        for g in (result.gaps or [])
+    ]
+    return {
+        "topic": result.query,
+        "n_papers": len(result.papers or []),
+        "clusters": clusters,
+        "gaps": gaps,
+        "elapsed_s": getattr(result, "total_duration_s", 0.0),
+        "status": getattr(result, "status", "completed"),
+        "error": getattr(result, "error_message", ""),
+        "report_md": getattr(result, "report_md", ""),
+        "demo": False,
+    }
+
+
+def run_research(topic: str, max_papers: int, force_demo: bool = False,
+                 on_event=None) -> dict:
+    """Single integration point between UI and backend."""
     t0 = time.time()
     if BACKEND_AVAILABLE and not force_demo:
-        # >>> EDIT to match ResearchPipeline's real interface <
-        pipe = ResearchPipeline()
-        raw = pipe.run(topic=topic, max_papers=max_papers)
-        result = _normalize(raw)
-        result["elapsed_s"] = round(time.time() - t0, 2)
-        result["demo"] = False
-        return result
+        pipeline = _build_pipeline(max_papers)
+        result = _run_pipeline_blocking(pipeline, topic, on_event=on_event)
+        out = _normalize(result)
+        if not out.get("elapsed_s"):
+            out["elapsed_s"] = round(time.time() - t0, 2)
+        return out
     time.sleep(0.6)
     return _demo_result(topic, max_papers, t0)
-
-
-def _normalize(raw) -> dict:
-    """Map your pipeline's return onto the keys the UI expects."""
-    if raw is None:
-        return {"topic": "", "n_papers": 0, "clusters": [], "gaps": []}
-    get = (lambda k, d: getattr(raw, k, raw.get(k, d))) if hasattr(raw, "get") \
-        else (lambda k, d: getattr(raw, k, d))
-    return {
-        "topic": get("topic", ""),
-        "n_papers": get("n_papers", 0),
-        "clusters": get("clusters", []),
-        "gaps": get("gaps", []),
-    }
 
 
 def _demo_result(topic: str, max_papers: int, t0: float) -> dict:
@@ -125,7 +203,8 @@ def _demo_result(topic: str, max_papers: int, t0: float) -> dict:
     return {
         "topic": topic, "n_papers": min(max_papers, 50),
         "clusters": clusters, "gaps": gaps,
-        "elapsed_s": round(time.time() - t0, 2), "demo": True,
+        "elapsed_s": round(time.time() - t0, 2),
+        "status": "completed", "error": "", "report_md": "", "demo": True,
     }
 
 
@@ -186,7 +265,6 @@ def render_sidebar() -> None:
             st.warning("Backend not connected — demo mode", icon="🧪")
             with st.expander("Why?"):
                 st.caption(BACKEND_ERROR or "Pipeline import failed.")
-                st.caption("Edit the adapter block in app/main.py to wire it in.")
 
         st.divider()
         st.subheader("Live system")
@@ -222,7 +300,7 @@ def render_home() -> None:
     with st.form("research_form"):
         topic = st.text_input(
             "Research topic",
-            placeholder="e.g. Federated Learning for Edge Devices",
+            placeholder="e.g. Multimodal Large Language Models for Medical Diagnosis",
         )
         c1, c2 = st.columns([3, 2])
         with c1:
@@ -231,7 +309,7 @@ def render_home() -> None:
             demo = st.toggle(
                 "Demo mode",
                 value=st.session_state.demo_toggle,
-                help="Run with built-in sample data (no API key / backend needed).",
+                help="Sample data, no API key / model download / cost.",
             )
         submitted = st.form_submit_button("🚀 Run analysis", use_container_width=True)
 
@@ -239,8 +317,26 @@ def render_home() -> None:
         if not topic and not demo:
             st.error("Enter a topic, or turn on demo mode.")
         else:
-            with st.spinner("Retrieving → embedding → clustering → gap detection…"):
-                result = run_research(topic, max_papers, force_demo=demo)
+            prog = st.progress(0)
+            status = st.empty()
+
+            def _on_event(ev) -> None:
+                try:
+                    prog.progress(min(int(ev.progress_pct), 100))
+                    status.text(str(ev.message))
+                except Exception:
+                    pass
+
+            with st.spinner("Running pipeline…"):
+                result = run_research(
+                    topic, max_papers, force_demo=demo,
+                    on_event=None if demo else _on_event,
+                )
+            prog.empty()
+            status.empty()
+
+            if result.get("status") == "failed":
+                st.error(f"Pipeline failed: {result.get('error', 'unknown error')}")
             st.session_state.last_result = result
             st.session_state.history.append(result)
 
@@ -269,12 +365,15 @@ def render_home() -> None:
                 top[1].markdown(f"`{g['confidence']:.2f}`")
                 st.caption(g["evidence"])
 
+        if result.get("report_md"):
+            with st.expander("Full report (Markdown)"):
+                st.markdown(result["report_md"])
+
         st.caption("Open the **Research Agent** page for the cluster map, and "
                    "**Lab Assistant** for the Gantt timeline.")
     else:
         st.divider()
-        st.markdown("Enter a topic above to start. The full cluster map and OS "
-                    "scheduling timeline live in the sidebar pages.")
+        st.markdown("Enter a topic above to start.")
 
 
 # --------------------------------------------------------------------------- #
