@@ -1,5 +1,1 @@
-# reports/ holds pipeline-generated run reports (*_research_report.md, PDFs).
-# These are runtime artifacts — keep the directory tracked, ignore the contents.
-*
-!.gitkeep
-!.gitignore
+
